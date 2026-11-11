@@ -1,123 +1,43 @@
-# Hermes Agent integration
+# Optional Hermes integration
 
-How to wire `scripts/guard.py` into Hermes Agent specifically, as a
-profile-scoped plugin.
+Hermes is one adapter target. The core skill and guard do not depend on it.
+Confirm installed Hermes APIs before implementing this example; internals can change.
 
-## 1. Plugin files
+1. Back up the relevant profile configuration and plugin directory.
+2. Copy `scripts/guard.py` into your plugin directory. Load it once under a canonical
+   module name; use that same module for Policy, CURRENT, Job, and wrappers.
+3. Install its HTTPX hook with the real inference hosts for the intended profiles.
+4. Bind the native turn entry point (`TurnFacadeMixin.run_conversation` in versions
+   exposing it) with `example_turn_wrapper`. Explicitly propagate the Job through
+   queued turns and thread workers. Native turn wrappers alone do not solve queue,
+   restart, or cross-process replay; add durable execution accounting where needed.
+5. Preserve existing enabled plugins, budgets, credentials, schedules, and models.
+   Do not replace `plugins.enabled` with a list containing only this plugin.
+6. Treat a stopped Job as final in the gateway supervisor, outside SDK retries.
+7. Restart and verify all actual model-hosting processes: gateway(s), dashboard,
+   desktop/web backend, and workers. Test as the service account, not just root.
 
-Hermes plugins live under `~/.hermes/plugins/<name>/` (or
-`<profile>/plugins/<name>/` for a profile-scoped install). Two files:
-
-`plugins/runaway-agent-protection/plugin.yaml`:
-
-```yaml
-name: runaway-agent-protection
-version: 1.0.0
-description: Runtime runaway protection (job calls/time/identical-repeat stop).
-```
-
-`plugins/runaway-agent-protection/__init__.py`:
-
-```python
-import importlib.util, sys
-from pathlib import Path
-
-def register(ctx):
-    name = 'runaway_agent_protection_guard'
-    g = sys.modules.get(name)
-    if g is None:
-        s = importlib.util.spec_from_file_location(
-            name, Path(__file__).parent / 'guard.py'
-        )
-        g = importlib.util.module_from_spec(s)
-        sys.modules[name] = g
-        s.loader.exec_module(g)
-    from scripts.guard import Policy
-    g.install(Policy(
-        job_calls=100,
-        job_seconds=3600,
-        identical_request_limit=6,
-        target_hosts=("your-provider-host.example.com",),
-    ))
-```
-
-Copy `scripts/guard.py` alongside `__init__.py`, or reference it from a
-shared location — either works since `install()` only needs importing.
-
-## 2. Enable the plugin
-
-```bash
-hermes config set plugins.enabled '["runaway-agent-protection"]'
-```
-
-(Append to the existing list rather than overwrite if other plugins are
-already enabled.)
-
-## 3. Hook the turn loop so retries/continuations share one Job
-
-Hermes's turn loop lives in `agent.turn_facade.TurnFacadeMixin.run_conversation`.
-Wrap it the same way `example_turn_wrapper()` does, inside `guard.py`'s
-`install()` or a follow-up call:
+An installation sketch inside your plugin's `register(ctx)`:
 
 ```python
-def _wrap_turn(current):
-    from agent.turn_facade import TurnFacadeMixin
-    if getattr(TurnFacadeMixin, '_runaway_protection_wrapped', False):
-        return
-    original = TurnFacadeMixin.run_conversation
+# g is your single imported guard module, including its shared CURRENT ContextVar.
+from agent.turn_facade import TurnFacadeMixin
 
-    def run(agent, *args, **kwargs):
-        inherited = current.get()
-        job = inherited or new_job()
-        token = current.set(job)
-        try:
-            return original(agent, *args, **kwargs)
-        finally:
-            current.reset(token)
-
-    TurnFacadeMixin.run_conversation = run
-    TurnFacadeMixin._runaway_protection_wrapped = True
+g.install(g.Policy(target_hosts=("your-actual-provider-host.example",)))
+if not getattr(TurnFacadeMixin, '_runaway_guard_wrapped', False):
+    TurnFacadeMixin.run_conversation = g.example_turn_wrapper(TurnFacadeMixin.run_conversation)
+    TurnFacadeMixin._runaway_guard_wrapped = True
 ```
 
-Call `_wrap_turn(CURRENT)` once from your plugin's `register()`, after
-`install()`.
+This is only the in-process skeleton, not a complete production Hermes plugin.
+Adapt native cancellation, durable queued execution IDs, review deduplication, and
+service initialization for your version before declaring full coverage.
 
-### Scoping to one provider/profile
+## Keep background reviews useful
 
-If you only want this guard on a specific provider's requests (e.g. one
-model provider used by one profile, not every provider in a multi-agent
-Hermes deployment), filter in the wrapper:
-
-```python
-def run(agent, *args, **kwargs):
-    if str(getattr(agent, 'provider', '')) != 'your-provider-name':
-        return original(agent, *args, **kwargs)
-    ...
-```
-
-This keeps the guard's blast radius to exactly the traffic you intend —
-important if other profiles/providers already have their own separate
-budget controls and you don't want two guards fighting over the same
-job accounting.
-
-## 4. Background review / other auxiliary tasks
-
-If your Hermes profile also runs automatic background reviews
-(`auxiliary.background_review`), that is a *separate* concern from this
-guard — disable it natively via config, don't try to make this guard
-do it:
-
-```yaml
-auxiliary:
-  background_review:
-    enabled: false   # false = skip automatic post-turn forks; manual /refine still works
-```
-
-## 5. Existing per-profile protections
-
-Do not install two guards against the same provider/host in the same
-profile — their job/streak counters will race and double-count. If a
-profile already has a protection plugin for a different provider (e.g.
-a separate subscription-budget guard for a different model backend),
-this plugin should filter to its own `target_hosts` / provider name so
-the two never overlap.
+Do not disable automatic reviews as the default runaway remedy. Preserve them,
+prevent review-on-review recursion, deduplicate snapshots, and count actual attempts.
+Where supported, `auxiliary.background_review.provider` and `.model` can select a
+separate review runtime. Discover available models and verify actual fork routing;
+do not paste a historical model ID or silently fall back to an expensive main model.
+See the companion cost-aware routing skill for that separate workflow.

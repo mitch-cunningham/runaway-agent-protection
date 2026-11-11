@@ -1,110 +1,89 @@
 ---
 name: runaway-agent-protection
-description: Use when an LLM agent needs hard runtime stops against runaway loops.
-version: 1.0.0
-author: Mitch Cunningham
+description: Add or audit runtime protection against runaway AI agent calls, retry storms, repeated background reviews, or unattended token drains. Use for Claude, GPT, Grok, Gemini, Hermes, or custom agent frameworks while preserving normal messages, tools, memory, collaboration, and scheduled jobs.
 license: MIT
-platforms: [linux, macos, windows]
+metadata:
+  compatibility: Instructions apply to any agent. The optional Python HTTPX adapter requires Python 3.10+ and httpx; other runtimes need their own dispatch adapter.
+  version: "2.0.0"
+  author: Mitch Cunningham
 ---
 
 # Runaway Agent Protection
 
-A small, framework-agnostic pattern for stopping an LLM agent that has
-gone runaway: too many requests, too much wall-clock time, or stuck
-repeating itself with no new input. It enforces at the HTTP transport
-layer — below the model's own control flow — so a confused or
-compromised agent loop cannot reason its way past the limit.
+Keep the agent useful. Stop the runaway job rather than disabling the organization.
+A downloaded skill provides instructions; actual protection requires a host runtime
+hook or native framework limit. Do not claim protection is installed until tested.
 
-This exists because prompting alone ("stop after N tries") is not a
-runtime guarantee: the LLM is the thing deciding whether to keep going,
-so a stuck loop, a buggy auto-continuation, or an adversarial prompt can
-all talk past an instruction-only limit. The fix has to sit outside the
-model's own judgment.
+## 1. Inspect before changing
 
-## When to use this
+Identify the framework, actual provider or proxy endpoints, request dispatch boundary,
+retry behavior, scheduler, background workers, and existing protections. Preserve the
+user's models, credentials, budgets, schedules, memory, and permissions unless the
+request specifically changes them. Keep useful existing limits; avoid duplicate guards.
 
-- You run an agent (Hermes, LangChain, a custom harness, anything built
-  on an OpenAI-compatible or httpx-based SDK) unattended — cron jobs,
-  background workers, long autonomous tasks.
-- You've had, or want to prevent, an incident where a background loop or
-  retry mechanism kept firing model requests well past the point anyone
-  noticed, burning budget or quota with no new work happening.
-- You want a stop that is structural (HTTP-layer), not advisory
-  (instructions the model could ignore under load or confusion).
+## 2. Account for one logical job
 
-## What it protects against
+A job includes its physical model attempts, SDK retries, automatic continuations,
+and related child work. A scheduled execution is already authorized by its schedule;
+it does not need another human approval. Give each new scheduled execution a new job.
+A retry, replay, or resumed execution of the same job retains its original counters.
 
-| Failure mode | Protection |
-|---|---|
-| A single logical job (one turn + its retries/continuations) runs forever | `job_calls` cap: stop after N model requests |
-| A job runs for an unbounded amount of wall-clock time | `job_seconds` cap: stop after N seconds |
-| The agent re-issues the same request with no new input or tool result | `identical_request_limit`: stop after N consecutive identical requests |
-| A scheduler/retrier auto-resumes a job that was already stopped | Once `Job.stopped` is set, every further request on that job id is rejected with the same reason — no silent auto-restart |
+Use a stable execution identity and shared accounting. The included in-process
+helper uses the same `Job` object and a `ContextVar`. An ID string alone does not
+restore state. Queued retries, process restarts, multiple workers, and multiple
+machines require a durable shared ledger in the framework adapter. Report that
+limitation if you cannot add it; do not silently reset counters.
 
-## Quick start
+## 3. Apply three limits at the model-call boundary
 
-```python
-from scripts.guard import Policy, install
+Suggested starting values, adjustable to real workloads:
 
-install(Policy(
-    job_calls=100,
-    job_seconds=3600,
-    identical_request_limit=6,
-    target_hosts=("api.openai.com",),   # or your provider's host
-))
-```
+- 100 physical model attempts per logical job, including SDK retries.
+- A one-hour admission deadline: reject subsequent calls after that time.
+- Six consecutive calls with the same user input and latest tool observations.
+  Allow six; block the seventh before it reaches the provider. Changed tool
+  observations count as progress. Assistant prose or request IDs alone do not.
 
-That's it for the HTTP-layer enforcement. The remaining piece is telling
-your framework what counts as "one job" — see below.
+Use a lock or transaction so parallel children cannot race past the call count.
+The deadline does not cancel an already-running request or tool: configure SDK
+request timeouts and host cancellation separately if needed.
 
-## Wiring "one job" into your framework
+## 4. Stop once, then wait
 
-A job must span every retry and automatic continuation that belongs to
-one human-initiated turn, otherwise a framework that silently retries on
-failure resets your counters every time and the cap never bites.
+On a limit, latch the job as stopped, cancel or discard its queued continuations,
+and report the reason once. Treat the stop as final outside SDK/framework retries;
+never turn it into a provider sign-in error, quota exhaustion, or automatic retry.
+Do not auto-restart, change job IDs, swap models, or use another credential to evade it.
+An explicitly new instruction can start a new job. Unrelated jobs continue normally.
 
-The pattern is a `contextvars.ContextVar` that the framework's turn/run
-function sets once at the top of a turn and every nested/recursive call
-inherits:
+No-progress detection is a heuristic. Customize it for the framework's tool protocol
+and test legitimate iteration; do not pretend it measures task success.
 
-```python
-from scripts.guard import example_turn_wrapper
+## 5. Preserve background learning
 
-original_run_turn = agent.run_turn
-agent.run_turn = example_turn_wrapper(original_run_turn)
-```
+Automatic reviews and memory maintenance can remain enabled. Prevent reviews from
+spawning further reviews, and deduplicate reviews of the same conversation snapshot.
+Put their real provider attempts under job accounting too. Do not disable all reviews,
+block all bot messages, or add human-only admission as a substitute for loop control.
+Lower-cost review routing is separate; see the companion
+[cost-aware-model-routing skill](https://github.com/mitch-cunningham/cost-aware-model-routing).
 
-See `references/hermes-integration.md` for the exact hook used to wire
-this into Hermes Agent's `TurnFacadeMixin.run_conversation`, and
-`references/testing.md` for how to verify the three triggers without
-spending real model calls.
+## 6. Integrate, test, and report
 
-## What this does NOT do
+Read [framework integration](references/framework-integration.md) for portable sync,
+async, scheduler, thread, and non-Python patterns. Use
+[scripts/guard.py](scripts/guard.py) only for supported HTTPX transports; install it
+with explicit provider hosts AND a logical job scope. Untagged model calls are rejected
+rather than receiving a new counter per request. Unknown transports need a native adapter.
+Hermes users can additionally read [the Hermes guide](references/hermes-integration.md).
 
-- It does not touch your provider's own account-level rate limits or
-  billing. It is a local, cheap, structural backstop in front of them.
-- It does not decide *why* a job should stop beyond the three triggers
-  above — it has no opinion on task correctness.
-- It does not auto-resume anything. Recovery is a deliberate decision by
-  whoever (or whatever) sends the next instruction — never automatic.
-- It is not a replacement for provider-side budget/quota controls; use
-  both.
+Run [the offline checks](references/testing.md) before deployment. Verify normal work,
+a new cron execution, changing tool results, exact stop boundaries, parallel requests,
+and stopped-job replay. Restart every long-lived process that hosts model clients,
+including web or desktop backends, and verify the actual service account can write
+its ledger. Avoid real model calls except a small bounded canary when necessary.
 
-## Scope this skill intentionally does not cover
-
-- Multi-process/multi-host job coordination (this is in-process; for a
-  shared ledger across processes, back `Job` with a database row instead
-  of an in-memory dataclass — the `admit()` function is pure and easy to
-  swap).
-- Non-HTTP transports (gRPC, local models called via a different client
-  library) — the same `admit()`/`Policy` logic applies, only the
-  `install()` interception point changes.
-
-## Files
-
-- `scripts/guard.py` — the guard itself: `Policy`, `Job`, `admit()`,
-  `install()`, and `example_turn_wrapper()`.
-- `references/hermes-integration.md` — exact plugin wiring for Hermes
-  Agent (config, plugin.yaml, where to hook `run_conversation`).
-- `references/testing.md` — how to test all three triggers with
-  simulated requests, no real model spend.
+Report briefly: changed scope, enforced limits, tested paths, unsupported adapters,
+and rollback location. Never invent dollar costs or subscription percentages from
+request counts or output tokens. No prompt-only or in-process mechanism is a billing
+guarantee or a security boundary against code with permission to remove the guard.
